@@ -831,14 +831,194 @@ function tryEmailAt(src, i) {
   return [i, e];
 }
 
+// ---- marked emStrong (Fix 20) ----
+// Faithful port of marked 18.1.3's emStrong tokenizer (gfm). It scans
+// the MASKED inline source for a matching closer instead of resolving
+// delimiter pairs with a CommonMark stack: inner opener-like runs add
+// their length to the required closer length `m`, rule-of-3-skipped
+// closers add to `f`, and a closer only matches once it exhausts `m`.
+// The stack resolved inner pairs first and disagreed with marked
+// whenever an inner **...** or a `` `...` `` code span sat next to a
+// closer (doc-01/03/07/09/11/16/20/23/28/30/35). The mask replaces
+// links / code spans / HTML tags with length-preserving '[aaa...]'
+// placeholders, so a delimiter inside a code span (or a code span's
+// unbalanced backticks, doc-28) can never serve as a closer.
+function _buildRx(tpl, map, flags) {
+  let s = tpl;
+  for (const k of Object.keys(map)) s = s.split(k).join(map[k]);
+  return new RegExp(s, flags);
+}
+const _EM_IT = '(?:[^\\s\\p{P}\\p{S}]|~)'; // notPunctSpace (gfm: ~ counts)
+const _EM_ST = '(?!~)[\\s\\p{P}\\p{S}]';   // punctSpace (gfm: ~ excluded)
+const _EM_YE = '(?!~)[\\p{P}\\p{S}]';      // punct (gfm: ~ excluded)
+const _EM_X = '[^\\s\\p{P}\\p{S}]';        // notPunctSpace (normal)
+const _EM_J = '[\\s\\p{P}\\p{S}]';         // punctSpace (normal)
+const _EM_D = '[\\p{P}\\p{S}]';            // punct (normal)
+// emStrongLDelim (gfm): _e with punct=ye.
+const EM_LDELIM = _buildRx('^(?:\\*+(?:((?!\\*)punct)|([^\\s*]))?)|^_+(?:((?!_)punct)|([^\\s_]))?', { punct: _EM_YE }, 'u');
+// emStrongRDelimAst (gfm): $e with it/st/ye.
+const EM_RDELIM_AST = _buildRx('^[^_*]*?__[^_*]*?\\*[^_*]*?(?=__)|[^*]+(?=[^*])|(?!\\*)punct(\\*+)(?=[\\s]|$)|notPunctSpace(\\*+)(?!\\*)(?=punctSpace|$)|(?!\\*)punctSpace(\\*+)(?=notPunctSpace)|[\\s](\\*+)(?!\\*)(?=punct)|(?!\\*)punct(\\*+)(?!\\*)(?=punct)|notPunctSpace(\\*+)(?=notPunctSpace)', { notPunctSpace: _EM_IT, punctSpace: _EM_ST, punct: _EM_YE }, 'gu');
+// emStrongRDelimUnd (gfm): kt template (7 alternatives; alt5 is
+// punctSpace-preceded, unlike pedantic ft's whitespace-only alt5).
+const EM_RDELIM_UND = _buildRx('^[^_*]*?\\*\\*[^_*]*?_[^_*]*?(?=\\*\\*)|[^_]+(?=[^_])|(?!_)punct(_+)(?=[\\s]|$)|notPunctSpace(_+)(?!_)(?=punctSpace|$)|(?!_)punctSpace(_+)(?=notPunctSpace)|[\\s](_+)(?!_)(?=punct)|(?!_)punct(_+)(?!_)(?=punct)', { notPunctSpace: _EM_X, punctSpace: _EM_J, punct: _EM_D }, 'gu');
+// marked's inline `punctuation` rule (space or punct, never * or _).
+const EM_INLINE_PUNCT = /^((?![*_])[\s\p{P}\p{S}])/u;
+const EM_ALNUM = /[\p{L}\p{N}]/u;
+
+// marked Lexer#n mask pieces (length-preserving).
+const _MASK_LE = '\\[(?:\\\\[\\s\\S]|[^\\[\\]\\\\])*\\]';
+const _MASK_LT = _buildRx('(?:[^\\[\\]\\\\`]*(?:\\[(?:brackets|\\\\[\\s\\S]|[^\\[\\]\\\\])*\\]|\\\\[\\s\\S]|`+(?!`)[^`]*?`+(?!`)|``+(?=\\]))){0,999}?[^\\[\\]\\\\`]*?', { brackets: _MASK_LE }, '').source;
+const _MASK_BE = '(?!\\s*\\])(?:\\\\[\\s\\S]|[^\\[\\]\\\\]){1,999}';
+// marked's c().replace() strips the ^ anchor from the inserted
+// patterns (T.caret), so reflinkSearch matches a ref-link ANYWHERE in
+// the text, not only at position 0.
+const _MASK_REFLINK = _buildRx('!?\\[(label)\\]\\[(ref)\\]', { label: _MASK_LT, ref: _MASK_BE }, '').source;
+const _MASK_NOLINK = _buildRx('!?\\[(ref)\\](?:\\[\\])?', { ref: _MASK_BE }, '').source;
+const MASK_REFLINK_SEARCH = new RegExp('(?:' + _MASK_REFLINK + '|' + _MASK_NOLINK + '(?!\\())', 'g');
+const MASK_ANY_PUNCT = /(`+)(?:[^`]|[^`][\s\S]*?[^`])\1(?!`)|`+|\\([\p{P}\p{S}])/gu;
+const MASK_BLOCK_SKIP = new RegExp('(?:' +
+  '\\[(?:[^\\[\\]`]|(?<a>`+)[^`]+\\k<a>(?!`))*?\\]\\((?:\\\\[\\s\\S]|[^\\s\\\\()]|\\((?:\\\\[\\s\\S]|[^\\s\\\\()])*\\))*\\)' +
+  '|(?<!`)()(?<b>`+)[^`]+?\\k<b>(?!`)' +
+  '|<(?! )[^<>]*?>)', 'g');
+
+// marked Lexer#linkInText: does `e` contain a link (inline or reflink
+// whose ref exists)? Used by the mask: a reflink whose label text itself
+// contains a link is NOT masked wholesale — only its inner links are
+// masked, so delimiters in the label stay visible to emStrong (cm-533:
+// `[foo *bar [baz][ref]*][ref]` keeps the `*`s, the em forms, and the
+// outer link is then rejected for containing a link, exactly like marked).
+function linkInText(e, refs) {
+  if (!e.includes('[')) return false;
+  const bs = new RegExp(MASK_BLOCK_SKIP.source, 'g');
+  for (const m of e.matchAll(bs)) {
+    // blockSkip alternatives starting with '[' are inline links
+    // (`[...](...)`); code spans start with '`', html with '<'.
+    if (m[0].charAt(0) === '[' && e.charAt(m.index - 1) !== '!') return true;
+  }
+  const rs = new RegExp(MASK_REFLINK_SEARCH.source, 'g');
+  for (const m of e.matchAll(rs)) {
+    const s = m[0], r = s.lastIndexOf('[');
+    if (s.charAt(0) === '!') continue;
+    if (!refs.has(normalizeLabel(s.slice(r + 1, -1)))) continue;
+    if (r > 1 && linkInText(s.slice(1, r - 1), refs)) continue;
+    return true;
+  }
+  return false;
+}
+
+function maskInline(src, refs) {
+  let t = src;
+  if (refs.size > 0 && src.indexOf('[') >= 0) {
+    // Fresh regex per recursive call: reusing the outer global regex
+    // inside its own replace callback would corrupt its lastIndex.
+    const repl = (r) => {
+      const o = r.lastIndexOf('[');
+      if (!refs.has(normalizeLabel(r.slice(o + 1, -1)))) return r;
+      if (o > 1 && r.charAt(0) !== '!') {
+        const label = r.slice(1, o - 1);
+        if (linkInText(label, refs)) {
+          return '[' + label.replace(new RegExp(MASK_REFLINK_SEARCH.source, 'g'), repl) + '][' + 'a'.repeat(r.length - o - 2) + ']';
+        }
+      }
+      return '[' + 'a'.repeat(r.length - 2) + ']';
+    };
+    t = t.replace(MASK_REFLINK_SEARCH, repl);
+  }
+  t = t.replace(MASK_ANY_PUNCT, (n, s, r) => r ? '+'.repeat(n.length) : s ? s + n.slice(s.length, -s.length).replace(/`/g, '+') + s : n);
+  t = t.replace(MASK_BLOCK_SKIP, (n) => '[' + 'a'.repeat(n.length - 2) + ']');
+  return t;
+}
+
+// marked fe(): start index of the last delimiter run of `ch` in the
+// masked text whose preceding char is not whitespace, or -1.
+function lastPossibleCloser(masked, ch) {
+  let v = -1;
+  const n = masked.length;
+  for (let s = 0; s < n; s++) {
+    if (masked[s] !== ch) continue;
+    const o = s === 0 ? '\n' : masked[s - 1];
+    let i = s + 1;
+    while (i < n && masked[i] === ch) i++;
+    if (o !== ' ' && o !== '\t' && o !== '\n' && o !== '\r' && o !== '\f') v = s;
+    s = i - 1;
+  }
+  return v;
+}
+
+// Try marked's emStrong at src[i] (a * or _ run); prevCh is the last
+// char of the previous text token ('' if none). Returns
+// {kind:1 em|2 strong, raw, inner} or null.
+function tryEmStrong(src, i, masked, prevCh) {
+  const e = src.slice(i);
+  const s = EM_LDELIM.exec(e);
+  if (!s || (!s[1] && !s[2] && !s[3] && !s[4])) return null;
+  const r = s[0][0];
+  const o = prevCh === r;
+  const pos = i;
+  let l = pos;
+  while (l > 0 && masked[l - 1] === r) l--;
+  const p = [...masked.slice(Math.max(0, l - 2), l)].at(-1) ?? '';
+  const h = p === '*' || p === '_' || EM_INLINE_PUNCT.test(p);
+  let n = prevCh;
+  if (l < pos) n = p;
+  const u = l < pos ? h : EM_INLINE_PUNCT.test(n);
+  if (s[4] && n.match(EM_ALNUM)) return null;
+  const d = s[1] || s[3] || '';
+  if (!d || !n || u) {
+    const k = [...s[0]].length - 1;
+    let m = k, f = 0;
+    const y = pos - l + k;
+    const R = !!p.trim() && (!!d || (r === '*' && !h));
+    if (r !== '*' && r !== '_') return null;
+    const A = r === '*' ? EM_RDELIM_AST : EM_RDELIM_UND;
+    const v = lastPossibleCloser(masked, r);
+    const Q = pos + k;
+    if (v < Q) return null;
+    const t2 = masked.slice(i + k);
+    const ee = v - Q;
+    let m2;
+    A.lastIndex = 0;
+    while ((m2 = A.exec(t2)) !== null && !(m2.index > ee)) {
+      const g = m2[1] || m2[2] || m2[3] || m2[4] || m2[5] || m2[6];
+      if (!g) continue;
+      let b = [...g].length;
+      if (m2[3] || m2[4]) { m += b; continue; }
+      else if (m2[5] || m2[6] || R) {
+        if (o && (m2[5] || m2[6])) break;
+        if (y % 3 && !((y + b) % 3)) { f += b; continue; }
+      }
+      m -= b;
+      if (m > 0) continue;
+      b = Math.min(b, b + m + f);
+      const te = [...m2[0]][0].length;
+      const M = e.slice(0, k + m2.index + te + b);
+      if (Math.min(k, b) % 2) return { kind: 1, raw: M, inner: M.slice(1, -1) };
+      return { kind: 2, raw: M, inner: M.slice(2, -2) };
+    }
+  }
+  return null;
+}
+
 function parseInlineParts(src, refs, inLink) {
   const parts = [];
   const n = src.length;
-  let i = 0, ts = 0, pendUnd = 0;
+  let i = 0, ts = 0;
+  // prevCh: last char of the previous TEXT token (marked Lexer#t `r`);
+  // a text token ending in '_' does NOT update it. Non-text tokens
+  // (link/code/html/escape) never update it.
+  let prevCh = '';
+  let masked = null;
+  const getMasked = () => (masked === null ? (masked = maskInline(src, refs)) : masked);
   // In a raw block (<pre>/<code>/<kbd>/<script>) text is output
   // verbatim: no entity decoding, no escaping (marked inlineText
   // escaped flag).
-  const flush = (to) => { if (to > ts) parts.push(DOCST.inRawBlock ? src.slice(ts, to) : escText(src.slice(ts, to))); };
+  const flush = (to) => {
+    if (to > ts) {
+      parts.push(DOCST.inRawBlock ? src.slice(ts, to) : escText(src.slice(ts, to)));
+      const lc = src[to - 1];
+      if (lc !== '_') prevCh = lc;
+    }
+  };
   while (i < n) {
     const c = src.charCodeAt(i);
     if (c === 92) { // backslash
@@ -943,11 +1123,32 @@ function parseInlineParts(src, refs, inLink) {
       }
       i++; continue;
     }
-    if (c === 42 || c === 95 || c === 126) { // emphasis delimiters
+    if (c === 42 || c === 95) { // * / _ emphasis: marked emStrong
       flush(i);
       let j = i, run = 0;
       while (j < n && src.charCodeAt(j) === c) { j++; run++; }
-      if (c === 126 && run >= 3) { parts.push('~'.repeat(run)); i = j; ts = i; continue; }
+      const hit = tryEmStrong(src, i, getMasked(), prevCh);
+      if (hit) {
+        // Inner text is tokenized fresh (marked inlineTokens(U));
+        // DOCST state is shared, no save/restore (unlike link text).
+        const children = parseInlineParts(hit.inner, refs, inLink);
+        parts.push({ k: hit.kind, c: children });
+        i += hit.raw.length; ts = i; continue;
+      }
+      // No match: consume ONE char as literal and retry emStrong at the
+      // next char (marked inlineText retries there). A partial run like
+      // `**foo*` must form `<em>` from the 2nd star (cm-442); consuming
+      // the whole run as literal kills it. A '_' char does not update
+      // prevCh (marked quirk).
+      parts.push(escText(src[i]));
+      if (c !== 95) prevCh = src[i];
+      i += 1; ts = i; continue;
+    }
+    if (c === 126) { // ~ strikethrough: still the delimiter stack
+      flush(i);
+      let j = i, run = 0;
+      while (j < n && src.charCodeAt(j) === c) { j++; run++; }
+      if (run >= 3) { parts.push('~'.repeat(run)); i = j; ts = i; continue; }
       const prev = i > 0 ? src.charCodeAt(i - 1) : -1;
       const next = j < n ? src.charCodeAt(j) : -1;
       const prevSpace = prev < 0 || isSpaceCode(prev);
@@ -956,19 +1157,7 @@ function parseInlineParts(src, refs, inLink) {
       const nextPunct = next >= 0 && isPunctCode(next);
       const leftFlank = !nextSpace && (!nextPunct || prevSpace || prevPunct);
       const rightFlank = !prevSpace && (!prevPunct || nextSpace || nextPunct);
-      let open, close2;
-      if (c === 95) {
-        open = leftFlank && (!rightFlank || prevPunct);
-        close2 = rightFlank && (!leftFlank || nextPunct);
-        // Open _ delimiters still pending when an email is scanned:
-        // a _ run after the email domain closes one of them, so the
-        // email is matched without the closer (see tryBareEmailAt).
-        if (open) pendUnd += run;
-        if (close2) pendUnd = Math.max(0, pendUnd - run);
-      } else {
-        open = leftFlank; close2 = rightFlank;
-      }
-      parts.push({ k: 9, ch: src[i], n: run, open, close: close2 });
+      parts.push({ k: 9, ch: '~', n: run, open: leftFlank, close: rightFlank });
       i = j; ts = i; continue;
     }
     if (c === 10) { // line break
@@ -1003,7 +1192,7 @@ function parseInlineParts(src, refs, inLink) {
     // __because@x__ linkifies) or after a char that is not a bare-email
     // local char (a!b@c.com links b@c.com — '!' breaks the local part).
     if (!inLink && !DOCST.inLink && isBareEmailLocalCode(c) && (i === ts || !isBareEmailLocalCode(src.charCodeAt(i - 1)))) {
-      const a = tryExtAutolink(src, i, pendUnd);
+      const a = tryExtAutolink(src, i, 0);
       if (a) {
         flush(i);
         parts.push({ k: 5, href: escAttr(encodeHref(a.href)), title: null, c: [escText(a.text)], auto: true });
