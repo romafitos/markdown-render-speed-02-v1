@@ -1161,10 +1161,19 @@ function parseInlineParts(src, refs, inLink) {
       i = j; ts = i; continue;
     }
     if (c === 10) { // line break
+      // marked's `r` (prevCh) is the last char of the previous TEXT token,
+      // and a text token includes the newline — so after a softbreak
+      // prevCh is '\n', not the last char before it. That matters for
+      // `_` openers: `foo\n__x__` must form <strong>, but with prevCh='o'
+      // the alnum check in tryEmStrong kills the first `_` (doc-02/03/08/
+      // 09/11/14). After a hard break the text token ends before the two
+      // trailing spaces, so prevCh is the last non-space char instead.
+      const prevBeforeFlush = prevCh;
       flush(i);
       let sp = 0, k = i - 1;
       while (k >= ts && src.charCodeAt(k) === 32) { sp++; k--; }
       if (sp >= 2) {
+        prevCh = k >= ts ? src[k] : prevBeforeFlush;
         const last = parts[parts.length - 1];
         if (typeof last === 'string') {
           let t = last;
@@ -1173,6 +1182,7 @@ function parseInlineParts(src, refs, inLink) {
         }
         parts.push({ k: 8 });
       } else {
+        prevCh = '\n';
         parts.push('\n');
       }
       i++;
