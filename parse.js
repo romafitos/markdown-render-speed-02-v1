@@ -385,16 +385,27 @@ function findBracket(src, i) {
     if (c === 96) {
       let k = j, run = 0;
       while (k < n && src.charCodeAt(k) === 96) { k++; run++; }
-      let m = k;
-      while (m < n) {
-        if (src.charCodeAt(m) === 96) {
-          let q = m, r2 = 0;
-          while (q < n && src.charCodeAt(q) === 96) { q++; r2++; }
-          if (r2 === run) { j = q - 1; break; }
-          m = q;
-        } else m++;
+      if (depth === 1) {
+        // Marked's label regex: a backtick run at label level needs a
+        // closing run of ANY length (`` ``fixes` `` is a code span for
+        // label matching — doc-06/09/12), or 2+ backticks right before
+        // ] (`` ``+(?=\]) ``, `[foo ``](x)`); otherwise the label fails.
+        if (run >= 2 && k < n && src.charCodeAt(k) === 93) { j = k - 1; continue; }
+        let m = k;
+        while (m < n) {
+          if (src.charCodeAt(m) === 96) {
+            let q = m;
+            while (q < n && src.charCodeAt(q) === 96) q++;
+            j = q - 1; break;
+          }
+          m++;
+        }
+        if (m >= n) return -1;
+      } else {
+        // Inside nested brackets backticks are plain characters (the
+        // nested pattern allows them): just skip the run.
+        j = k - 1;
       }
-      if (m >= n) return -1;
       continue;
     }
     if (c === 91) depth++;
@@ -662,7 +673,8 @@ function stripAutolinkTail(src, start, end) {
 
 // Try an extended autolink (www. / scheme:// / email / scheme:email) at src[i].
 // Returns {href, text, end} or null. Caller guarantees word-start position.
-function tryExtAutolink(src, i) {
+// pendUnd is the count of still-open _ delimiters (see tryBareEmailAt).
+function tryExtAutolink(src, i, pendUnd) {
   const n = src.length;
   // scheme: [A-Za-z][A-Za-z0-9+.-]{1,31}:
   if (isLetterDigit(src.charCodeAt(i)) && src.charCodeAt(i) < 128 &&
@@ -691,7 +703,7 @@ function tryExtAutolink(src, i) {
         }
       }
       // scheme:email[/one-segment]
-      const em = tryEmailAt(src, j + 1);
+      const em = tryBareEmailAt(src, j + 1, pendUnd);
       if (em) {
         let e = em[1];
         if (e < n && src.charCodeAt(e) === 47) {
@@ -725,12 +737,85 @@ function tryExtAutolink(src, i) {
     return null;
   }
   // bare email
-  const em = tryEmailAt(src, i);
+  const em = tryBareEmailAt(src, i, pendUnd);
   if (em) {
     const text = src.slice(i, em[1]);
     return { href: 'mailto:' + text, text, end: em[1] };
   }
   return null;
+}
+
+// Bare-email local part per marked's url regex It: [A-Za-z0-9._+-]
+// (narrower than isEmailLocalCode: !#$%&'*+/=?^`{|}~ are NOT local
+// chars here, so a!b@c.com linkifies only b@c.com).
+function isBareEmailLocalCode(c) {
+  return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) ||
+    c === 46 || c === 95 || c === 43 || c === 45;
+}
+function isBareDomainCode(c) { // [A-Za-z0-9_-]
+  return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 45 || c === 95;
+}
+function isAlnumCode(c) {
+  return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+}
+
+// Domain of marked's bare-email regex It:
+// [A-Za-z0-9-_]+ (?:\.[A-Za-z0-9-_]*[A-Za-z0-9])+  over src[s..e).
+function bareDomainValid(src, s, e) {
+  let idx = s;
+  if (idx >= e || !isBareDomainCode(src.charCodeAt(idx))) return false;
+  while (idx < e && isBareDomainCode(src.charCodeAt(idx))) idx++;
+  let groups = 0;
+  while (idx < e) {
+    if (src.charCodeAt(idx) !== 46) return false;
+    idx++;
+    const gs = idx;
+    while (idx < e && isBareDomainCode(src.charCodeAt(idx))) idx++;
+    if (idx === gs) return false;
+    if (!isAlnumCode(src.charCodeAt(idx - 1))) return false;
+    groups++;
+  }
+  return groups >= 1;
+}
+
+// Bare-email match mirroring marked's url regex It:
+// [A-Za-z0-9._+-]+ @ [A-Za-z0-9-_]+(?:\.[A-Za-z0-9-_]*[A-Za-z0-9])+ (?![\w-])
+// Greedy with backtracking: the longest domain prefix satisfying the
+// lookahead wins, so because@mark.example.com_ links because@mark.example
+// (the .com is left literal) while because@mark.example.com_x links whole.
+// Used for bare emails and scheme:email; angle autolinks keep the strict
+// tryEmailAt (marked's wt regex has no _ in domain labels).
+// pendUnd: number of still-open _ delimiters before this position. When
+// the domain is followed by a _ run that closes one of them, marked
+// matches the email inside the emphasis text (without the closer), so the
+// full domain stands: __because@bar.com__ links the whole address.
+function tryBareEmailAt(src, i, pendUnd) {
+  const n = src.length;
+  let j = i;
+  while (j < n && isBareEmailLocalCode(src.charCodeAt(j))) j++;
+  if (j === i || j >= n || src.charCodeAt(j) !== 64) return null;
+  let k = j + 1;
+  while (k < n) {
+    const c = src.charCodeAt(k);
+    if (isAlnumCode(c) || c === 45 || c === 95 || c === 46) k++; else break;
+  }
+  let backEnd = -1, fullEnd = -1;
+  for (let e = k; e > j + 1; e--) {
+    if (!isAlnumCode(src.charCodeAt(e - 1))) continue;
+    if (!bareDomainValid(src, j + 1, e)) continue;
+    if (fullEnd < 0) fullEnd = e;
+    if (e < n) {
+      const c = src.charCodeAt(e);
+      if (isAlnumCode(c) || c === 45 || c === 95) continue;
+    }
+    backEnd = e;
+    break;
+  }
+  if (fullEnd < 0) return null;
+  let end = backEnd;
+  if ((end < 0 || fullEnd > end) && pendUnd > 0 && src.charCodeAt(fullEnd) === 95) end = fullEnd;
+  if (end < 0) return null;
+  return [i, end];
 }
 
 // Try an email address at src[i]; returns [start, end] or null.
@@ -749,8 +834,11 @@ function tryEmailAt(src, i) {
 function parseInlineParts(src, refs, inLink) {
   const parts = [];
   const n = src.length;
-  let i = 0, ts = 0;
-  const flush = (to) => { if (to > ts) parts.push(escText(src.slice(ts, to))); };
+  let i = 0, ts = 0, pendUnd = 0;
+  // In a raw block (<pre>/<code>/<kbd>/<script>) text is output
+  // verbatim: no entity decoding, no escaping (marked inlineText
+  // escaped flag).
+  const flush = (to) => { if (to > ts) parts.push(DOCST.inRawBlock ? src.slice(ts, to) : escText(src.slice(ts, to))); };
   while (i < n) {
     const c = src.charCodeAt(i);
     if (c === 92) { // backslash
@@ -793,10 +881,24 @@ function parseInlineParts(src, refs, inLink) {
         i = ae; ts = i; continue;
       }
       const he = parseHtmlTag(src, i);
-      if (he > 0) { flush(i); parts.push({ k: 7, s: src.slice(i, he) }); i = he; ts = i; continue; }
+      if (he > 0) {
+        flush(i);
+        const tag = src.slice(i, he);
+        // marked tag(): <a␣...> sets inLink (only with a space after a;
+        // <a>, <a\t, <a\n do not), </a> clears it; <pre|code|kbd|script>
+        // sets inRawBlock, its end tag clears it. inLink persists for
+        // the whole document (doc-03); inRawBlock resets per block-level
+        // inline tokenization (parseInline).
+        if (!DOCST.inLink && /^<a /i.test(tag)) DOCST.inLink = true;
+        else if (DOCST.inLink && /^<\/a>/i.test(tag)) DOCST.inLink = false;
+        if (!DOCST.inRawBlock && /^<(pre|code|kbd|script)(\s|>)/i.test(tag)) DOCST.inRawBlock = true;
+        else if (DOCST.inRawBlock && /^<\/(pre|code|kbd|script)(\s|>)/i.test(tag)) DOCST.inRawBlock = false;
+        parts.push({ k: 7, s: tag }); i = he; ts = i; continue;
+      }
       i++; continue;
     }
-    if (c === 38) { // '&' entity
+    if (c === 38) { // '&' entity (not decoded inside a raw block)
+      if (DOCST.inRawBlock) { i++; continue; }
       const de = decodeEntity(src, i);
       if (de) { flush(i); parts.push(de[2] ? escText(de[0]) : de[0]); i = de[1]; ts = i; continue; }
       i++; continue;
@@ -807,7 +909,12 @@ function parseInlineParts(src, refs, inLink) {
         const inner = src.slice(i + 2, close);
         const tail = parseLinkTail(src, close + 1, refs, inner);
         if (tail) {
+          // marked De(): inLink is saved/restored around link-text
+          // tokenization; inRawBlock is NOT restored for images (a <pre>
+          // inside alt text leaks into the rest of this tokenization).
+          const saveLink = DOCST.inLink;
           const children = parseInlineParts(inner, refs, true);
+          DOCST.inLink = saveLink;
           const rawAlt = plainText(children);
           flush(i);
           parts.push({ k: 6, src: escAttr(encodeHref(tail.href)), alt: escAttr(rawAlt), rawAlt, title: tail.title !== null ? escAttr(tail.title) : null });
@@ -822,8 +929,13 @@ function parseInlineParts(src, refs, inLink) {
         const inner = src.slice(i + 1, close);
         const tail = parseLinkTail(src, close + 1, refs, inner);
         if (tail) {
+          const saveLink = DOCST.inLink, saveRaw = DOCST.inRawBlock;
           const children = parseInlineParts(inner, refs, true);
-          if (containsLink(children)) { i++; continue; }
+          // marked De(): if the link text emitted a link, the outer
+          // link never forms AND inRawBlock is restored; otherwise only
+          // inLink is restored and inRawBlock leaks.
+          if (containsLink(children)) { DOCST.inLink = saveLink; DOCST.inRawBlock = saveRaw; i++; continue; }
+          DOCST.inLink = saveLink;
           flush(i);
           parts.push({ k: 5, href: escAttr(encodeHref(tail.href)), title: tail.title !== null ? escAttr(tail.title) : null, c: children });
           i = tail.end; ts = i; continue;
@@ -848,6 +960,11 @@ function parseInlineParts(src, refs, inLink) {
       if (c === 95) {
         open = leftFlank && (!rightFlank || prevPunct);
         close2 = rightFlank && (!leftFlank || nextPunct);
+        // Open _ delimiters still pending when an email is scanned:
+        // a _ run after the email domain closes one of them, so the
+        // email is matched without the closer (see tryBareEmailAt).
+        if (open) pendUnd += run;
+        if (close2) pendUnd = Math.max(0, pendUnd - run);
       } else {
         open = leftFlank; close2 = rightFlank;
       }
@@ -877,9 +994,16 @@ function parseInlineParts(src, refs, inLink) {
     }
     // Extended autolinks (bare URL / www. / email) are disabled inside
     // link or image text (marked state.inLink — doc-01: a bare URL in
-    // link text stays plain text and the outer link forms).
-    if (!inLink && (c >= 65 && c <= 122) && (i === 0 || !isEmailLocalCode(src.charCodeAt(i - 1)))) {
-      const a = tryExtAutolink(src, i);
+    // link text stays plain text and the outer link forms) and anywhere
+    // after an unclosed <a␣...> tag earlier in the document (doc-03:
+    // DOCST.inLink persists across paragraphs).
+    // An email may start at any [A-Za-z0-9._+-] char (digits, '.', '_',
+    // '+', '-' included: 1@a.com, .a@b.com linkify), and at the start
+    // of a text run (right after a delimiter/code/link/html construct:
+    // __because@x__ linkifies) or after a char that is not a bare-email
+    // local char (a!b@c.com links b@c.com — '!' breaks the local part).
+    if (!inLink && !DOCST.inLink && isBareEmailLocalCode(c) && (i === ts || !isBareEmailLocalCode(src.charCodeAt(i - 1)))) {
+      const a = tryExtAutolink(src, i, pendUnd);
       if (a) {
         flush(i);
         parts.push({ k: 5, href: escAttr(encodeHref(a.href)), title: null, c: [escText(a.text)], auto: true });
@@ -894,6 +1018,7 @@ function parseInlineParts(src, refs, inLink) {
 }
 
 function parseInline(src, refs) {
+  DOCST.inRawBlock = false; // marked lex(): reset before each queued item
   return renderParts(parseInlineParts(src, refs));
 }
 
@@ -1772,7 +1897,15 @@ function renderBlocks(blocks, refs) {
   return out;
 }
 
+// Document-level lexer state, mirroring marked's Lexer.state. inLink
+// persists across every inline tokenization in the document (an unclosed
+// <a ...> tag in one paragraph disables extended autolinks in all later
+// ones — doc-03); inRawBlock is reset before each block-level inline
+// tokenization (marked's lex() queue loop) but leaks within one.
+const DOCST = { inLink: false, inRawBlock: false };
+
 export function parse(markdown) {
+  DOCST.inLink = false; DOCST.inRawBlock = false;
   const src = markdown.replace(/\r\n?/g, '\n').replace(/\0/g, '\uFFFD');
   let lines = src === '' ? [] : src.split('\n');
   if (src.endsWith('\n')) lines.pop();
