@@ -877,8 +877,13 @@ const _MASK_NOLINK = _buildRx('!?\\[(ref)\\](?:\\[\\])?', { ref: _MASK_BE }, '')
 const MASK_REFLINK_SEARCH = new RegExp('(?:' + _MASK_REFLINK + '|' + _MASK_NOLINK + '(?!\\())', 'g');
 const MASK_ANY_PUNCT = /(`+)(?:[^`]|[^`][\s\S]*?[^`])\1(?!`)|`+|\\([\p{P}\p{S}])/gu;
 const MASK_BLOCK_SKIP = new RegExp('(?:' +
-  '\\[(?:[^\\[\\]`]|(?<a>`+)[^`]+\\k<a>(?!`))*?\\]\\((?:\\\\[\\s\\S]|[^\\s\\\\()]|\\((?:\\\\[\\s\\S]|[^\\s\\\\()])*\\))*\\)' +
-  '|(?<!`)()(?<b>`+)[^`]+?\\k<b>(?!`)' +
+  // marked ot: the href char class is [^\\\(\)] — whitespace IS allowed
+  // (angle-bracket hrefs may contain spaces). Our old [^\\s\\\\()] excluded
+  // spaces, so `[...](<url with space>)` was not masked and the `_`s in
+  // its label wrongly formed emphasis (doc-16/20/23: `[at _node `` a ` b ``_]`
+  // must stay literal). Code alternative is greedy [^`]+, like marked.
+  '\\[(?:[^\\[\\]`]|(?<a>`+)[^`]+\\k<a>(?!`))*?\\]\\((?:\\\\[\\s\\S]|[^\\\\()]|\\((?:\\\\[\\s\\S]|[^\\\\()])*\\))*\\)' +
+  '|(?<!`)()(?<b>`+)[^`]+\\k<b>(?!`)' +
   '|<(?! )[^<>]*?>)', 'g');
 
 // marked Lexer#linkInText: does `e` contain a link (inline or reflink
