@@ -1003,9 +1003,13 @@ function parseInlineParts(src, refs, inLink) {
   const parts = [];
   const n = src.length;
   let i = 0, ts = 0;
-  // prevCh: last char of the previous TEXT token (marked Lexer#t `r`);
-  // a text token ending in '_' does NOT update it. Non-text tokens
-  // (link/code/html/escape) never update it.
+  // prevCh: marked Lexer#t `r` — the last char of the previous TEXT
+  // token, and ONLY if that token was text: after any non-text token
+  // (link/code/html/escape/br/em/strong/del) the loop resets it to ''
+  // (`s||(r="")` at the top of marked's inlineTokens loop). A text
+  // token ending in '_' does NOT update it. Getting this wrong kills
+  // `__`/`_` openers after a br, a code span or a link (doc-03/09/11/
+  // 36/37) or wrongly lets intraword `_` open (doc-16/20/23).
   let prevCh = '';
   let masked = null;
   const getMasked = () => (masked === null ? (masked = maskInline(src, refs)) : masked);
@@ -1024,9 +1028,9 @@ function parseInlineParts(src, refs, inLink) {
     if (c === 92) { // backslash
       const nc = i + 1 < n ? src.charCodeAt(i + 1) : -1;
       if (nc >= 0 && isAsciiPunctCode(nc)) {
-        flush(i); parts.push(escText(src[i + 1])); i += 2; ts = i; continue;
+        flush(i); parts.push(escText(src[i + 1])); prevCh = ''; i += 2; ts = i; continue;
       }
-      if (nc === 10) { flush(i); parts.push({ k: 8 }); i += 2; while (i < n && (src.charCodeAt(i) === 32 || src.charCodeAt(i) === 9)) i++; ts = i; continue; }
+      if (nc === 10) { flush(i); parts.push({ k: 8 }); prevCh = ''; i += 2; while (i < n && (src.charCodeAt(i) === 32 || src.charCodeAt(i) === 9)) i++; ts = i; continue; }
       i++; continue;
     }
     if (c === 96) { // code span
@@ -1042,13 +1046,13 @@ function parseInlineParts(src, refs, inLink) {
           m = q;
         } else m++;
       }
-      if (close < 0) { parts.push('`'.repeat(run)); i = j; ts = i; continue; }
+      if (close < 0) { parts.push('`'.repeat(run)); prevCh = '`'; i = j; ts = i; continue; }
       let content = src.slice(j, close).replace(/\n/g, ' ');
       if (content.length >= 2 && content.charCodeAt(0) === 32 && content.charCodeAt(content.length - 1) === 32 && content.trim() !== '') {
         content = content.slice(1, -1);
       }
       parts.push({ k: 4, s: escText(content), raw: content });
-      i = closeEnd; ts = i; continue;
+      prevCh = ''; i = closeEnd; ts = i; continue;
     }
     if (c === 60) { // '<' autolink or HTML
       const ae = autolinkEnd(src, i);
@@ -1058,7 +1062,7 @@ function parseInlineParts(src, refs, inLink) {
         const isMail = !(colon > 0 && /^[A-Za-z][A-Za-z0-9+.-]{1,31}$/.test(inner.slice(0, colon)) && colon + 1 < inner.length);
         flush(i);
         parts.push({ k: 5, href: escAttr((isMail ? 'mailto:' : '') + encodeHref(inner)), title: null, c: [escText(inner)], auto: true });
-        i = ae; ts = i; continue;
+        prevCh = ''; i = ae; ts = i; continue;
       }
       const he = parseHtmlTag(src, i);
       if (he > 0) {
@@ -1073,14 +1077,14 @@ function parseInlineParts(src, refs, inLink) {
         else if (DOCST.inLink && /^<\/a>/i.test(tag)) DOCST.inLink = false;
         if (!DOCST.inRawBlock && /^<(pre|code|kbd|script)(\s|>)/i.test(tag)) DOCST.inRawBlock = true;
         else if (DOCST.inRawBlock && /^<\/(pre|code|kbd|script)(\s|>)/i.test(tag)) DOCST.inRawBlock = false;
-        parts.push({ k: 7, s: tag }); i = he; ts = i; continue;
+        parts.push({ k: 7, s: tag }); prevCh = ''; i = he; ts = i; continue;
       }
       i++; continue;
     }
     if (c === 38) { // '&' entity (not decoded inside a raw block)
       if (DOCST.inRawBlock) { i++; continue; }
       const de = decodeEntity(src, i);
-      if (de) { flush(i); parts.push(de[2] ? escText(de[0]) : de[0]); i = de[1]; ts = i; continue; }
+      if (de) { flush(i); parts.push(de[2] ? escText(de[0]) : de[0]); prevCh = src[de[1] - 1]; i = de[1]; ts = i; continue; }
       i++; continue;
     }
     if (c === 33 && i + 1 < n && src.charCodeAt(i + 1) === 91) { // image
@@ -1098,7 +1102,7 @@ function parseInlineParts(src, refs, inLink) {
           const rawAlt = plainText(children);
           flush(i);
           parts.push({ k: 6, src: escAttr(encodeHref(tail.href)), alt: escAttr(rawAlt), rawAlt, title: tail.title !== null ? escAttr(tail.title) : null });
-          i = tail.end; ts = i; continue;
+          prevCh = ''; i = tail.end; ts = i; continue;
         }
       }
       i++; continue;
@@ -1118,7 +1122,7 @@ function parseInlineParts(src, refs, inLink) {
           DOCST.inLink = saveLink;
           flush(i);
           parts.push({ k: 5, href: escAttr(encodeHref(tail.href)), title: tail.title !== null ? escAttr(tail.title) : null, c: children });
-          i = tail.end; ts = i; continue;
+          prevCh = ''; i = tail.end; ts = i; continue;
         }
       }
       i++; continue;
@@ -1133,7 +1137,7 @@ function parseInlineParts(src, refs, inLink) {
         // DOCST state is shared, no save/restore (unlike link text).
         const children = parseInlineParts(hit.inner, refs, inLink);
         parts.push({ k: hit.kind, c: children });
-        i += hit.raw.length; ts = i; continue;
+        prevCh = ''; i += hit.raw.length; ts = i; continue;
       }
       // No match: consume ONE char as literal and retry emStrong at the
       // next char (marked inlineText retries there). A partial run like
@@ -1148,7 +1152,7 @@ function parseInlineParts(src, refs, inLink) {
       flush(i);
       let j = i, run = 0;
       while (j < n && src.charCodeAt(j) === c) { j++; run++; }
-      if (run >= 3) { parts.push('~'.repeat(run)); i = j; ts = i; continue; }
+      if (run >= 3) { parts.push('~'.repeat(run)); prevCh = '~'; i = j; ts = i; continue; }
       const prev = i > 0 ? src.charCodeAt(i - 1) : -1;
       const next = j < n ? src.charCodeAt(j) : -1;
       const prevSpace = prev < 0 || isSpaceCode(prev);
@@ -1158,7 +1162,7 @@ function parseInlineParts(src, refs, inLink) {
       const leftFlank = !nextSpace && (!nextPunct || prevSpace || prevPunct);
       const rightFlank = !prevSpace && (!prevPunct || nextSpace || nextPunct);
       parts.push({ k: 9, ch: '~', n: run, open: leftFlank, close: rightFlank });
-      i = j; ts = i; continue;
+      prevCh = ''; i = j; ts = i; continue;
     }
     if (c === 10) { // line break
       // marked's `r` (prevCh) is the last char of the previous TEXT token,
@@ -1166,14 +1170,14 @@ function parseInlineParts(src, refs, inLink) {
       // prevCh is '\n', not the last char before it. That matters for
       // `_` openers: `foo\n__x__` must form <strong>, but with prevCh='o'
       // the alnum check in tryEmStrong kills the first `_` (doc-02/03/08/
-      // 09/11/14). After a hard break the text token ends before the two
-      // trailing spaces, so prevCh is the last non-space char instead.
-      const prevBeforeFlush = prevCh;
+      // 09/11/14). After a hard break the previous token is a br (non-text),
+      // so prevCh resets to '' and `foo  \n__bar__` forms <strong>
+      // (doc-09/36/37).
       flush(i);
       let sp = 0, k = i - 1;
       while (k >= ts && src.charCodeAt(k) === 32) { sp++; k--; }
       if (sp >= 2) {
-        prevCh = k >= ts ? src[k] : prevBeforeFlush;
+        prevCh = '';
         const last = parts[parts.length - 1];
         if (typeof last === 'string') {
           let t = last;
@@ -1206,7 +1210,7 @@ function parseInlineParts(src, refs, inLink) {
       if (a) {
         flush(i);
         parts.push({ k: 5, href: escAttr(encodeHref(a.href)), title: null, c: [escText(a.text)], auto: true });
-        i = a.end; ts = i; continue;
+        prevCh = ''; i = a.end; ts = i; continue;
       }
     }
     i++;
