@@ -206,6 +206,26 @@ function stripLead(s) {
   return s.slice(i);
 }
 
+// Lazy-continuation line leading whitespace (marked: a lazy line is
+// re-tokenized as its own block and merged into the preceding paragraph
+// or text token — an indented-code line, >= 4 columns of indent, is
+// dedented by exactly 4 columns with the remainder kept verbatim, tabs
+// included; a line with fewer than 4 columns of indent is kept verbatim).
+function stripLazyIndent(s) {
+  let col = 0, i = 0;
+  while (i < s.length && col < 4) {
+    const c = s.charCodeAt(i);
+    if (c === 32) { col++; i++; }
+    else if (c === 9) {
+      const next = col + 4 - (col % 4);
+      if (next <= 4) { col = next; i++; }
+      else break;
+    } else break;
+  }
+  if (col < 4) return s;
+  return s.slice(i);
+}
+
 // marked's cleanUrl: encodeURI, then restore '%' (so %20 stays %20).
 function encodeHref(s) {
   try { return encodeURI(s).replace(/%25/g, '%'); } catch { return s; }
@@ -1846,7 +1866,7 @@ function parseBlocks(lines, start, end, refs, isTop, docEndsNL, inItem) {
         // lines only as paragraph continuations — a line after an open
         // fence is NOT quote content (doc-01 `used foo_bar_baz used`).
         if (sub.length > 0 && sub[sub.length - 1] !== '' && !canInterrupt(l2) && lastIsParagraph(sub, refs)) {
-          let lazy = stripLead(stripLazyMark(l2));
+          let lazy = stripLazyIndent(stripLazyMark(l2));
           if (sub[sub.length - 1].charCodeAt(0) === 1) {
             const [li, lx] = indentInfo(lazy);
             if (li <= 3 && isSetextLine(lazy.slice(lx)) > 0) lazy = '    ' + lazy;
@@ -2063,7 +2083,7 @@ function parseList(lines, start, end, refs, listInd, m0) {
       // (raw, no sentinel — doc-02 `function f(a, b) {`); otherwise
       // paragraph text with the \u0001 sentinel.
       if (lastBlockIsCode(cur.lines, refs, true)) cur.lines.push(line);
-      else cur.lines.push('\u0001' + stripLead(stripLazyMark(line)));
+      else cur.lines.push('\u0001' + stripLazyIndent(stripLazyMark(line)));
       i++; continue;
     }
     break;
