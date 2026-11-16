@@ -272,13 +272,16 @@ function plainText(parts) {
   return out;
 }
 
-// Does this parsed inline tree contain a link node? A link's text may not
-// hold another link (cm-518/519/532/533): when it does, the outer link
-// never forms and the inner one stands.
+// Does this parsed inline tree contain an EXPLICIT link node? A link's
+// text may not hold another (explicit) link (cm-518/519/532/533): when
+// it does, the outer link never forms and the inner one stands.
+// Autolinks do NOT count: marked still forms the outer link around an
+// angle autolink, and bare-URL autolinks are disabled inside link text
+// (inLink) so they never occur there.
 function containsLink(parts) {
   for (const p of parts) {
     if (typeof p !== 'object') continue;
-    if (p.k === 5) return true;
+    if (p.k === 5 && !p.auto) return true;
     if ((p.k === 1 || p.k === 2 || p.k === 3) && containsLink(p.c)) return true;
   }
   return false;
@@ -743,7 +746,7 @@ function tryEmailAt(src, i) {
   return [i, e];
 }
 
-function parseInlineParts(src, refs) {
+function parseInlineParts(src, refs, inLink) {
   const parts = [];
   const n = src.length;
   let i = 0, ts = 0;
@@ -786,7 +789,7 @@ function parseInlineParts(src, refs) {
         const colon = inner.indexOf(':');
         const isMail = !(colon > 0 && /^[A-Za-z][A-Za-z0-9+.-]{1,31}$/.test(inner.slice(0, colon)) && colon + 1 < inner.length);
         flush(i);
-        parts.push({ k: 5, href: escAttr((isMail ? 'mailto:' : '') + encodeHref(inner)), title: null, c: [escText(inner)] });
+        parts.push({ k: 5, href: escAttr((isMail ? 'mailto:' : '') + encodeHref(inner)), title: null, c: [escText(inner)], auto: true });
         i = ae; ts = i; continue;
       }
       const he = parseHtmlTag(src, i);
@@ -804,7 +807,7 @@ function parseInlineParts(src, refs) {
         const inner = src.slice(i + 2, close);
         const tail = parseLinkTail(src, close + 1, refs, inner);
         if (tail) {
-          const children = parseInlineParts(inner, refs);
+          const children = parseInlineParts(inner, refs, true);
           const rawAlt = plainText(children);
           flush(i);
           parts.push({ k: 6, src: escAttr(encodeHref(tail.href)), alt: escAttr(rawAlt), rawAlt, title: tail.title !== null ? escAttr(tail.title) : null });
@@ -819,7 +822,7 @@ function parseInlineParts(src, refs) {
         const inner = src.slice(i + 1, close);
         const tail = parseLinkTail(src, close + 1, refs, inner);
         if (tail) {
-          const children = parseInlineParts(inner, refs);
+          const children = parseInlineParts(inner, refs, true);
           if (containsLink(children)) { i++; continue; }
           flush(i);
           parts.push({ k: 5, href: escAttr(encodeHref(tail.href)), title: tail.title !== null ? escAttr(tail.title) : null, c: children });
@@ -872,11 +875,14 @@ function parseInlineParts(src, refs) {
       }
       ts = i; continue;
     }
-    if ((c >= 65 && c <= 122) && (i === 0 || !isEmailLocalCode(src.charCodeAt(i - 1)))) {
+    // Extended autolinks (bare URL / www. / email) are disabled inside
+    // link or image text (marked state.inLink — doc-01: a bare URL in
+    // link text stays plain text and the outer link forms).
+    if (!inLink && (c >= 65 && c <= 122) && (i === 0 || !isEmailLocalCode(src.charCodeAt(i - 1)))) {
       const a = tryExtAutolink(src, i);
       if (a) {
         flush(i);
-        parts.push({ k: 5, href: escAttr(encodeHref(a.href)), title: null, c: [escText(a.text)] });
+        parts.push({ k: 5, href: escAttr(encodeHref(a.href)), title: null, c: [escText(a.text)], auto: true });
         i = a.end; ts = i; continue;
       }
     }
@@ -1445,10 +1451,11 @@ function parseBlocks(lines, start, end, refs, isTop, docEndsNL, inItem) {
         // block start (cm-238: "    - bar" -> "foo\n- bar"). A setext
         // underline that follows another lazy line is padded with four
         // spaces (marked's blockquoteSetextReplace, cm-093).
-        if (sub.length > 0 && !canInterrupt(l2) && prevLineAllowsLazy(sub[sub.length - 1])) {
-          // A lazy line after an open fenced code block is fence
-          // content (raw, no sentinel); otherwise paragraph text.
-          if (lastBlockIsCode(sub, refs, false)) { sub.push(l2); k++; continue; }
+        // Lazy continuation line of the quote's paragraph. Unlike list
+        // items (marked's list tokenizer), a blockquote gathers lazy
+        // lines only as paragraph continuations — a line after an open
+        // fence is NOT quote content (doc-01 `used foo_bar_baz used`).
+        if (sub.length > 0 && sub[sub.length - 1] !== '' && !canInterrupt(l2) && lastIsParagraph(sub, refs)) {
           let lazy = stripLead(stripLazyMark(l2));
           if (sub[sub.length - 1].charCodeAt(0) === 1) {
             const [li, lx] = indentInfo(lazy);
