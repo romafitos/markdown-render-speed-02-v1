@@ -190,6 +190,19 @@ function stripColsE(s, cols) {
   return expandLead(s.slice(i), col);
 }
 
+// marked's fence-content dedent (Dt / indentCodeCompensation): strip up
+// to N leading whitespace CHARS (not columns) from each content line,
+// where N is the fence opening line's leading-whitespace char count.
+// A tab counts as ONE char here, so a tab line loses its tab entirely
+// (doc-13); and it applies only to backtick fences — tilde fences get
+// no dedent at all (doc-22/29: `~~~` content keeps its indent).
+function fenceDedent(s, n) {
+  if (n <= 0) return s;
+  let i = 0;
+  while (i < s.length && i < n && (s.charCodeAt(i) === 32 || s.charCodeAt(i) === 9)) i++;
+  return i === 0 ? s : s.slice(i);
+}
+
 // Strip lazy-continuation marks (\u0001) from the front of a line.
 // Several can accumulate when a lazy line passes through nested
 // blockquotes/lists (cm-250/251/292/293).
@@ -1733,6 +1746,9 @@ function parseBlocks(lines, start, end, refs, isTop, docEndsNL, inItem) {
       if (j >= 3 && !(c0 === 96 && rest.slice(j).indexOf('`') >= 0)) {
         const infoRaw = rest.slice(j).replace(/^[ \t]+/, '').replace(/[ \t]+$/, '');
         const info = unescapeStr(infoRaw.split(/[ \t]/)[0] || '');
+        // marked's Dt: fence content is dedented by the opening line's
+        // leading-whitespace char count (idx), backtick fences only.
+        const fenceChars = idx;
         const content = [];
         let k = i + 1, closed = false;
         while (k < end) {
@@ -1748,7 +1764,7 @@ function parseBlocks(lines, start, end, refs, isTop, docEndsNL, inItem) {
               if (e >= r2.length) { closed = true; break; }
             }
           }
-          content.push(stripCols(l2, ind));
+          content.push(c0 === 96 ? fenceDedent(l2, fenceChars) : l2);
           k++;
         }
         if (!closed) {
