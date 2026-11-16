@@ -619,28 +619,42 @@ function scanDomain(src, i) {
   return [j, dots];
 }
 
-// Strip trailing punctuation from a candidate autolink [start,end); returns new end.
+// Strip trailing punctuation from a candidate autolink [start,end);
+// returns new end. Mirrors marked's _backpedal regex for extended
+// autolinks: the URL is the longest prefix matching
+// /(?:[^?!.,:;*_'"~()&]+|\([^)]*\)|&(?![A-Za-z0-9]+;$)|[?!.,:;*_'"~)]+(?!$))+/
+// - a trailing run of ?!.,:;*_'"~) is dropped (so a closing * or _
+//   stays available as an emphasis delimiter, doc-01);
+// - a balanced (...) group is kept, an unmatched ( ends the URL;
+// - & starting an entity reference (name; at the very end) ends it.
 function stripAutolinkTail(src, start, end) {
-  while (end > start) {
-    const c = src[end - 1];
-    if (c === ';') {
-      let k = end - 2;
-      while (k >= start && ((src.charCodeAt(k) >= 48 && src.charCodeAt(k) <= 57) || (src.charCodeAt(k) >= 65 && src.charCodeAt(k) <= 90) || (src.charCodeAt(k) >= 97 && src.charCodeAt(k) <= 122))) k--;
-      if (k >= start && src[k] === '&') { end = k; continue; }
-      end--; continue;
+  const PUNCT_TAIL = '?!.,:;*_\'"~)';
+  let i = start, validEnd = start;
+  while (i < end) {
+    const c = src[i];
+    if (c === '(') {
+      let j = i + 1;
+      while (j < end && src[j] !== ')') j++;
+      if (j >= end) break; // no closing ')' in the candidate: stop here
+      i = j + 1; validEnd = i; continue;
     }
-    if (c === '?' || c === '!' || c === '.' || c === ',' || c === ':') { end--; continue; }
-    if (c === ')') {
-      let open = 0, close = 0;
-      for (let k = start; k < end; k++) {
-        if (src[k] === '(') open++;
-        else if (src[k] === ')') close++;
-      }
-      if (close > open) { end--; continue; }
+    if (c === '&') {
+      let j = i + 1;
+      while (j < end && ((src.charCodeAt(j) >= 48 && src.charCodeAt(j) <= 57) ||
+        (src.charCodeAt(j) >= 65 && src.charCodeAt(j) <= 90) ||
+        (src.charCodeAt(j) >= 97 && src.charCodeAt(j) <= 122))) j++;
+      if (j > i + 1 && j + 1 === end && src[j] === ';') break; // entity at end
+      i++; validEnd = i; continue;
     }
-    break;
+    if (PUNCT_TAIL.indexOf(c) >= 0) {
+      let j = i;
+      while (j < end && PUNCT_TAIL.indexOf(src[j]) >= 0) j++;
+      if (j >= end) break; // trailing punctuation run: drop it
+      i = j; validEnd = j; continue;
+    }
+    i++; validEnd = i;
   }
-  return end;
+  return validEnd;
 }
 
 // Try an extended autolink (www. / scheme:// / email / scheme:email) at src[i].
@@ -890,11 +904,51 @@ function countDefLines(lines, refs) {
   return n;
 }
 
+// Does the previous (already stripped) line of a list item / blockquote
+// allow a non-indented line after it to be a lazy continuation?
+// Marked's list tokenizer rule (doc-02): a lazy line is appended unless
+// the previous line was blank, is indented >= 4 columns (indented
+// code), or starts a fence / ATX heading / HTML block / thematic
+// break. In particular a line of fence CONTENT does not block laziness
+// — `function f(a, b) {` at indent 0 inside an item's ```css fence is
+// still item content. This replaces the too-strict "last block must be
+// a paragraph" gate.
+function prevLineAllowsLazy(prev) {
+  if (prev === '') return false;
+  const [pi, px] = indentInfo(prev);
+  if (pi >= 4) return false;
+  const rest = prev.slice(px);
+  if (rest.length === 0) return false;
+  const c = rest.charCodeAt(0);
+  if (c === 35) {
+    let j = 0;
+    while (j < rest.length && rest.charCodeAt(j) === 35) j++;
+    if (j <= 6 && (j === rest.length || rest.charCodeAt(j) === 32 || rest.charCodeAt(j) === 9)) return false;
+  }
+  if (c === 96 || c === 126) {
+    let j = 0;
+    while (j < rest.length && rest.charCodeAt(j) === c) j++;
+    if (j >= 3 && !(c === 96 && rest.slice(j).indexOf('`') >= 0)) return false;
+  }
+  if (c === 60) { const t = htmlBlockType(rest); if (t >= 1 && t <= 6) return false; }
+  if (isThematicBreak(rest)) return false;
+  return true;
+}
+
+// Is the last top-level block of `lines` a code block? (Reached from a
+// lazy line, a closed fence/heading/hr would already have failed
+// prevLineAllowsLazy, so a 'c' here is an unclosed fenced code block
+// whose content the lazy line joins.)
+function lastBlockIsCode(lines, refs, inItem) {
+  const blocks = parseBlocks(lines, 0, lines.length, refs, false, false, inItem);
+  return blocks.length > 0 && blocks[blocks.length - 1].t === 'c';
+}
+
 // Is the deepest last block of `lines` (parsed as blocks) a paragraph?
 // Laziness only applies to paragraph continuation lines.
-function lastIsParagraph(lines, refs) {
+function lastIsParagraph(lines, refs, inItem) {
   if (lines.length === 0) return false;
-  const blocks = parseBlocks(lines, 0, lines.length, refs, false, false);
+  const blocks = parseBlocks(lines, 0, lines.length, refs, false, false, inItem);
   if (blocks.length === 0) return false;
   let b = blocks[blocks.length - 1];
   for (;;) {
@@ -1011,7 +1065,12 @@ function htmlBlockType(rest) {
 }
 
 // Can this line start a block that interrupts a paragraph?
-function canInterrupt(line) {
+// `inItem`: inside a list item's content, ANY list marker interrupts
+// the paragraph (marked tokenizes item text with state.top=false, so
+// the line-by-line `text` tokenizer stops at any marker — doc-01
+// `505791.`). At top level / in blockquotes only a 1-start ordered
+// list (or any bullet) interrupts.
+function canInterrupt(line, inItem) {
   const [ind, idx] = indentInfo(line);
   if (ind > 3) return false;
   const rest = line.slice(idx);
@@ -1033,7 +1092,7 @@ function canInterrupt(line) {
   if (m) {
     if (m.empty) return false;
     if (m.bullet) return true;
-    return m.num === 1;
+    return inItem ? true : m.num === 1;
   }
   return false;
 }
@@ -1067,19 +1126,12 @@ function splitTableRow(line) {
       cur += '\\'; i++; continue;
     }
     if (c === 96) {
-      let j = i, run = 0;
-      while (j < n && line.charCodeAt(j) === 96) { j++; run++; }
-      let m = j, found = -1;
-      while (m < n) {
-        if (line.charCodeAt(m) === 96) {
-          let q = m, r2 = 0;
-          while (q < n && line.charCodeAt(q) === 96) { q++; r2++; }
-          if (r2 === run) { found = q; break; }
-          m = q;
-        } else m++;
-      }
-      if (found < 0) { cur += line.slice(i); i = n; break; }
-      cur += unescapePipe(line.slice(i, found)); i = found; continue;
+      // Backticks do NOT protect pipes in table cells (marked splits
+      // `a | b` inside backticks, and an unmatched backtick must not
+      // swallow the rest of the row): treat them as ordinary chars.
+      // `\|` -> `|` unescaping is handled by the backslash branch
+      // above, so `\|` inside a code span still renders as `|`.
+      cur += '`'; i++; continue;
     }
     if (c === 124) { cells.push(cur); cur = ''; i++; continue; }
     cur += line[i]; i++;
@@ -1088,6 +1140,35 @@ function splitTableRow(line) {
   if (cells.length > 0 && cells[0].trim() === '') cells.shift();
   if (cells.length > 0 && cells[cells.length - 1].trim() === '') cells.pop();
   return cells.map((s) => s.trim());
+}
+
+// Is `line` a table body row in marked's sense? The table regex's row
+// part excludes: blank lines (spaces only — a TAB-only line is a ROW,
+// doc-02), ATX headings, thematic breaks, blockquotes, fenced code,
+// indented code, list markers (bullet or 1-start ordered), HTML blocks.
+function isTableRowLine(line) {
+  if (/^ *$/.test(line)) return false; // empty or spaces-only (tab-only is a row)
+  const [ind, idx] = indentInfo(line);
+  const rest = line.slice(idx);
+  if (rest.length === 0) return true; // whitespace-only line with a tab: a row
+  if (ind >= 4) return false; // indented code (needs a non-space char after the indent)
+  const c = rest.charCodeAt(0);
+  if (c === 35) {
+    let j = 0;
+    while (j < rest.length && rest.charCodeAt(j) === 35) j++;
+    if (j <= 6 && (j === rest.length || rest.charCodeAt(j) === 32 || rest.charCodeAt(j) === 9)) return false;
+  }
+  if (c === 96 || c === 126) {
+    let j = 0;
+    while (j < rest.length && rest.charCodeAt(j) === c) j++;
+    if (j >= 3 && !(c === 96 && rest.slice(j).indexOf('`') >= 0)) return false;
+  }
+  if (c === 62) return false;
+  if (c === 60) { const t = htmlBlockType(rest); if (t >= 1 && t <= 6) return false; }
+  if (isThematicBreak(rest)) return false;
+  const m = listMarker(line, ind, idx);
+  if (m && !m.empty && (m.bullet || m.num === 1)) return false;
+  return true;
 }
 
 function isDelimiterRow(line) {
@@ -1099,7 +1180,7 @@ function isDelimiterRow(line) {
     let a = 0;
     if (/^:-+:$/.test(t)) a = 2;
     else if (/^-+:$/.test(t)) a = 1;
-    else if (/^:-+$/.test(t)) a = 0;
+    else if (/^:-+$/.test(t)) a = 3; // left: marked emits align="left"
     else if (/^-+$/.test(t)) a = 0;
     else return null;
     aligns.push(a);
@@ -1197,7 +1278,7 @@ function parseRefDef(lines, k, refs) {
   return consumed;
 }
 
-function parseBlocks(lines, start, end, refs, isTop, docEndsNL) {
+function parseBlocks(lines, start, end, refs, isTop, docEndsNL, inItem) {
   const out = [];
   // Looseness tracking (cm-307/318/319): a block records whether a blank
   // line preceded it AT THIS LEVEL, so a list can tell whether two of
@@ -1364,7 +1445,10 @@ function parseBlocks(lines, start, end, refs, isTop, docEndsNL) {
         // block start (cm-238: "    - bar" -> "foo\n- bar"). A setext
         // underline that follows another lazy line is padded with four
         // spaces (marked's blockquoteSetextReplace, cm-093).
-        if (sub.length > 0 && sub[sub.length - 1] !== '' && !canInterrupt(l2) && lastIsParagraph(sub, refs)) {
+        if (sub.length > 0 && !canInterrupt(l2) && prevLineAllowsLazy(sub[sub.length - 1])) {
+          // A lazy line after an open fenced code block is fence
+          // content (raw, no sentinel); otherwise paragraph text.
+          if (lastBlockIsCode(sub, refs, false)) { sub.push(l2); k++; continue; }
           let lazy = stripLead(stripLazyMark(l2));
           if (sub[sub.length - 1].charCodeAt(0) === 1) {
             const [li, lx] = indentInfo(lazy);
@@ -1417,7 +1501,7 @@ function parseBlocks(lines, start, end, refs, isTop, docEndsNL) {
             if (countDefLines(para, refs) >= para.length) { para.push(l2); k++; continue; }
             para.push(l2); k++; break;
           }
-          if (canInterrupt(l2)) break;
+          if (canInterrupt(l2, inItem)) break;
         }
         para.push(l2.charCodeAt(0) === 1 ? stripLazyMark(l2) : l2);
         k++;
@@ -1452,6 +1536,15 @@ function parseBlocks(lines, start, end, refs, isTop, docEndsNL) {
               const cells = splitTableRow(rem[r]);
               while (cells.length < head.length) cells.push('');
               rows.push(cells.slice(0, head.length));
+            }
+            // Rows continue past the paragraph's blank-line break while
+            // the following lines are table rows in marked's sense (a
+            // tab-only line is a row, not a blank — doc-02).
+            while (k < end && isTableRowLine(lines[k])) {
+              const cells = splitTableRow(lines[k]);
+              while (cells.length < head.length) cells.push('');
+              rows.push(cells.slice(0, head.length));
+              k++;
             }
             emit({ t: 'tb', aligns, head, rows });
             i = k; continue;
@@ -1568,14 +1661,18 @@ function parseList(lines, start, end, refs, listInd, m0) {
       cur.lines.push(stripColsE(line, cur.contentCol));
       i++; continue;
     }
-    if (cur.lines.length > 0 && cur.lines[cur.lines.length - 1] !== '' && !canInterrupt(line) && lastIsParagraph(cur.lines, refs)) {
-      cur.lines.push('\u0001' + stripLead(stripLazyMark(line)));
+    if (cur.lines.length > 0 && !canInterrupt(line, true) && prevLineAllowsLazy(cur.lines[cur.lines.length - 1])) {
+      // A lazy line after an open fenced code block is fence content
+      // (raw, no sentinel — doc-02 `function f(a, b) {`); otherwise
+      // paragraph text with the \u0001 sentinel.
+      if (lastBlockIsCode(cur.lines, refs, true)) cur.lines.push(line);
+      else cur.lines.push('\u0001' + stripLead(stripLazyMark(line)));
       i++; continue;
     }
     break;
   }
   finishItem();
-  const parsedItems = items.map((it) => ({ blocks: parseBlocks(it.lines, 0, it.lines.length, refs, false, false), checked: it.checked }));
+  const parsedItems = items.map((it) => ({ blocks: parseBlocks(it.lines, 0, it.lines.length, refs, false, false, true), checked: it.checked }));
   // A list is loose when any item directly contains two blocks with a
   // blank line between them (blankBefore on any block after the first).
   // Leading blanks of an item do not count (cm-278/279).
@@ -1643,7 +1740,7 @@ function renderBlocks(blocks, refs) {
       case 'tb': {
         out += '<table>\n<thead>\n<tr>\n';
         for (let ci = 0; ci < b.head.length; ci++) {
-          out += '<th' + (b.aligns[ci] === 1 ? ' align="right"' : b.aligns[ci] === 2 ? ' align="center"' : '') + '>' +
+          out += '<th' + (b.aligns[ci] === 1 ? ' align="right"' : b.aligns[ci] === 2 ? ' align="center"' : b.aligns[ci] === 3 ? ' align="left"' : '') + '>' +
             parseInline(b.head[ci], refs) + '</th>\n';
         }
         out += '</tr>\n</thead>\n';
@@ -1652,7 +1749,7 @@ function renderBlocks(blocks, refs) {
           for (const row of b.rows) {
             out += '<tr>\n';
             for (let ci = 0; ci < b.head.length; ci++) {
-              out += '<td' + (b.aligns[ci] === 1 ? ' align="right"' : b.aligns[ci] === 2 ? ' align="center"' : '') + '>' +
+              out += '<td' + (b.aligns[ci] === 1 ? ' align="right"' : b.aligns[ci] === 2 ? ' align="center"' : b.aligns[ci] === 3 ? ' align="left"' : '') + '>' +
                 parseInline(row[ci], refs) + '</td>\n';
             }
             out += '</tr>\n';
