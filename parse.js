@@ -1841,10 +1841,16 @@ function parseBlocks(lines, start, end, refs, isTop, docEndsNL, inItem) {
           while (k < end && !isBlankLine(lines[k])) { raw.push(lines[k]); k++; }
           endsAtBlank = k < end;
         }
-        // The raw text keeps its final newline unless the next line is blank
-        // (or there is none and this is not the top level / the document
-        // does not end with a newline).
-        const trail = k < end ? !isBlankLine(lines[k]) : (isTop && docEndsNL);
+        // The raw text keeps its final newline unless the next line is
+        // empty (or there is none and this is not the top level / the
+        // document does not end with a newline). marked's html tokenizer
+        // strips trailing blank lines only when there are 2+ of them, so
+        // a whitespace-only next line (tab/spaces) still keeps the '\n'
+        // for types 1-5 (doc-15); types 6-7 end at a blank line, whose
+        // newline is always stripped.
+        const trail = k < end
+          ? (type <= 5 ? lines[k] !== '' : !isBlankLine(lines[k]))
+          : (isTop && docEndsNL);
         emit({ t: 'x', raw: raw.length ? raw.join('\n') + (trail ? '\n' : '') : '' });
         i = k; continue;
       }
