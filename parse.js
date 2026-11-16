@@ -1004,6 +1004,64 @@ function tryEmStrong(src, i, masked, prevCh) {
   return null;
 }
 
+// ---- marked del tokenizer (gfm) ----
+// Port of marked 18.1.3's Tokenizer#del. The old `~` delimiter stack
+// resolved del during the same scan, so a `**` closer inside the del
+// was followed by `~~` in the scan context and misread as an opener
+// (doc-06/19: `~~used **new remove `utf-8()`**~~` stayed literal).
+// Marked tokenizes `~~...~~` as one token and re-tokenizes its inner
+// text fresh, where the `**` closer sits at end-of-inner-text and
+// forms <strong>. Closer runs must be EXACTLY the opener length.
+const DEL_LDELIM = /^~~?(?:((?!~)[\p{P}\p{S}])|[^\s~])/u;
+const DEL_RDELIM = /^[^~]+(?=[^~])|(?!~)[\p{P}\p{S}](~~?)(?=[\s]|$)|[^\s\p{P}\p{S}](~~?)(?!~)(?=[\s\p{P}\p{S}]|$)|(?!~)[\s\p{P}\p{S}](~~?)(?=[^\s\p{P}\p{S}])|[\s](~~?)(?!~)(?=[\p{P}\p{S}])|(?!~)[\p{P}\p{S}](~~?)(?!~)(?=[\p{P}\p{S}])|[^\s\p{P}\p{S}](~~?)(?=[^\s\p{P}\p{S}])/gu;
+
+// marked fe(): start index of the last `~` run whose preceding char is
+// not whitespace, or -1.
+function lastPossibleDelCloser(masked) {
+  let v = -1;
+  const n = masked.length;
+  for (let s = 0; s < n; s++) {
+    if (masked[s] !== '~') continue;
+    const o = s === 0 ? '\n' : masked[s - 1];
+    let i = s + 1;
+    while (i < n && masked[i] === '~') i++;
+    if (o !== ' ' && o !== '\t' && o !== '\n' && o !== '\r' && o !== '\f') v = s;
+    s = i - 1;
+  }
+  return v;
+}
+
+// Try marked's del at src[i] (a `~` run). Returns {raw, inner} or null.
+function tryDel(src, i, masked, prevCh) {
+  const e = src.slice(i);
+  const s = DEL_LDELIM.exec(e);
+  if (!s) return null;
+  if (!((s[1] || '') || !prevCh || EM_INLINE_PUNCT.test(prevCh))) return null;
+  const o = [...s[0]].length - 1;
+  let p = o;
+  const u = lastPossibleDelCloser(masked);
+  const d = masked.length - e.length + o;
+  if (u < d) return null;
+  const t2 = masked.slice(-e.length + o);
+  const k = u - d;
+  let m2;
+  DEL_RDELIM.lastIndex = 0;
+  while ((m2 = DEL_RDELIM.exec(t2)) !== null && !(m2.index > k)) {
+    const g = m2[1] || m2[2] || m2[3] || m2[4] || m2[5] || m2[6];
+    if (!g) continue;
+    const l = [...g].length;
+    if (l !== o) continue;
+    if (m2[3] || m2[4]) { p += l; continue; }
+    p -= l;
+    if (p > 0) continue;
+    const ll = Math.min(l, l + p);
+    const te = [...m2[0]][0].length;
+    const raw = e.slice(0, o + m2.index + te + ll);
+    return { raw, inner: raw.slice(o, -o) };
+  }
+  return null;
+}
+
 function parseInlineParts(src, refs, inLink) {
   const parts = [];
   const n = src.length;
@@ -1153,21 +1211,20 @@ function parseInlineParts(src, refs, inLink) {
       if (c !== 95) prevCh = src[i];
       i += 1; ts = i; continue;
     }
-    if (c === 126) { // ~ strikethrough: still the delimiter stack
+    if (c === 126) { // ~ strikethrough: marked del tokenizer
       flush(i);
-      let j = i, run = 0;
-      while (j < n && src.charCodeAt(j) === c) { j++; run++; }
-      if (run >= 3) { parts.push('~'.repeat(run)); prevCh = '~'; i = j; ts = i; continue; }
-      const prev = i > 0 ? src.charCodeAt(i - 1) : -1;
-      const next = j < n ? src.charCodeAt(j) : -1;
-      const prevSpace = prev < 0 || isSpaceCode(prev);
-      const prevPunct = prev >= 0 && isPunctCode(prev);
-      const nextSpace = next < 0 || isSpaceCode(next);
-      const nextPunct = next >= 0 && isPunctCode(next);
-      const leftFlank = !nextSpace && (!nextPunct || prevSpace || prevPunct);
-      const rightFlank = !prevSpace && (!prevPunct || nextSpace || nextPunct);
-      parts.push({ k: 9, ch: '~', n: run, open: leftFlank, close: rightFlank });
-      prevCh = ''; i = j; ts = i; continue;
+      const hit = tryDel(src, i, getMasked(), prevCh);
+      if (hit) {
+        // Inner text is tokenized fresh (marked inlineTokens(m)).
+        const children = parseInlineParts(hit.inner, refs, inLink);
+        parts.push({ k: 3, c: children });
+        prevCh = ''; i += hit.raw.length; ts = i; continue;
+      }
+      // No match: one `~` as literal text (marked inlineText retries
+      // del at the next `~`); a run of 3+ with no closer stays literal.
+      parts.push('~');
+      prevCh = '~';
+      i += 1; ts = i; continue;
     }
     if (c === 10) { // line break
       // marked's `r` (prevCh) is the last char of the previous TEXT token,
